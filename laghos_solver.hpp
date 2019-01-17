@@ -72,12 +72,17 @@ protected:
 
    Array<int> &ess_tdofs;
 
-   const int dim, nzones, l2dofs_cnt, h1dofs_cnt, source_type;
+   int nzones;
+   const int dim, l2dofs_cnt, h1dofs_cnt, source_type;
    const double cfl;
    const bool use_viscosity, p_assembly;
    const double cg_rel_tol;
    const int cg_max_iter;
    Coefficient *material_pcf;
+   
+   ParGridFunction& rho0;
+   GridFunctionCoefficient rho0_coeff; 
+   ParGridFunction x0_gf;
 
    // Velocity mass matrix and local inverses of the energy mass matrices. These
    // are constant in time, due to the pointwise mass conservation property.
@@ -143,6 +148,10 @@ public:
    // The density values, which are stored only at some quadrature points, are
    // projected as a ParGridFunction.
    void ComputeDensity(ParGridFunction &rho);
+   
+   //MeshAdapt Update of the operator
+   void UpdateEssentialTrueDofs();
+   void MeshAdaptUpdate(const Vector& S, const ParGridFunction &disp_gf);
 
    void PrintTimingData(bool IamRoot, int steps);
 

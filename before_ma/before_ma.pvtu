@@ -1,0 +1,21 @@
+<VTKFile type="PUnstructuredGrid">
+<PUnstructuredGrid GhostLevel="0">
+<PPoints>
+<PDataArray type="Float64" Name="coordinates" NumberOfComponents="3" format="binary"/>
+</PPoints>
+<PPointData>
+<PDataArray type="Float64" Name="V_field" NumberOfComponents="3" format="binary"/>
+<PDataArray type="Float64" Name="Crd_field" NumberOfComponents="3" format="binary"/>
+<PDataArray type="Float64" Name="U_field" NumberOfComponents="3" format="binary"/>
+<PDataArray type="Float64" Name="size" NumberOfComponents="1" format="binary"/>
+</PPointData>
+<PCellData>
+<PDataArray type="Float64" Name="E_field_1" NumberOfComponents="1" format="binary"/>
+<PDataArray type="Int32" Name="apf_part" NumberOfComponents="1" format="binary"/>
+</PCellData>
+<Piece Source="0/0.vtu"/>
+<Piece Source="0/1.vtu"/>
+<Piece Source="0/2.vtu"/>
+<Piece Source="0/3.vtu"/>
+</PUnstructuredGrid>
+</VTKFile>

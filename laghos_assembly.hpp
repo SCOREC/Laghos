@@ -65,6 +65,13 @@ struct QuadratureData
       : Jac0inv(dim, dim, nzones * quads_per_zone),
         stressJinvT(nzones * quads_per_zone, dim, dim),
         rho0DetJ0w(nzones * quads_per_zone) { }
+   
+   void Resize(int dim, int nzones, int quads_per_zone)                                    
+   {                                                                                      
+       Jac0inv.SetSize(dim, dim, nzones * quads_per_zone);                                
+       stressJinvT.SetSize(nzones * quads_per_zone, dim, dim);                           
+       rho0DetJ0w.SetSize(nzones * quads_per_zone);              
+   }  
 };
 
 // Stores values of the one-dimensional shape functions and gradients at all 1D

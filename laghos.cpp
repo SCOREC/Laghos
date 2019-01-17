@@ -49,12 +49,29 @@
 //    p = 1  --> Sedov blast.
 //    p = 2  --> 1D Sod shock tube.
 //    p = 3  --> Triple point.
+//Possible pumi run:
+//    mpirun -np 4 ./laghos -ot 0 -ok 1 -fa -p 1 
 
 
 #include "laghos_solver.hpp"
 #include <memory>
 #include <iostream>
 #include <fstream>
+#include <sstream>
+
+#include "../mfem/general/text.hpp"
+
+#ifdef MFEM_USE_SIMMETRIX
+#include <SimUtil.h>
+#include <gmi_sim.h>
+#endif
+#include <apfMDS.h>
+#include <gmi_null.h>
+#include <PCU.h>
+#include <apfConvert.h>
+#include <gmi_mesh.h>
+#include <crv.h>
+#include <spr.h>
 
 using namespace std;
 using namespace mfem;
@@ -75,7 +92,16 @@ int main(int argc, char *argv[])
    if (mpi.Root()) { display_banner(cout); }
 
    // Parse command-line options.
-   const char *mesh_file = "data/square01_quad.mesh";
+   const char *mesh_file = "data/pumi/4/sedov5p.smb";
+   const char *boundary_file = "data/pumi/boundary.mesh";
+#ifdef MFEM_USE_SIMMETRIX
+   const char *model_file = "data/pumi/geom/sedov.x_t";
+#else
+   const char *model_file = "data/pumi/geom/sedov5.dmg";
+#endif   
+   int geom_order = 1;
+   double adapt_ratio = 0.05;
+   
    int rs_levels = 0;
    int rp_levels = 0;
    int order_v = 2;
@@ -93,6 +119,7 @@ int main(int argc, char *argv[])
    bool gfprint = false;
    const char *basename = "results/Laghos";
    int partition_type = 111;
+   double ma_time = 0.2;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -141,6 +168,10 @@ int main(int argc, char *argv[])
                   "of zones in each direction, e.g., the number of zones in direction x\n\t"
                   "must be divisible by the number of MPI tasks in direction x.\n\t"
                   "Available options: 11, 21, 111, 211, 221, 311, 321, 322, 432.");
+   args.AddOption(&adapt_ratio, "-ar", "--adapt_ratio",
+                  "adaptation factor used in MeshAdapt");
+   args.AddOption(&ma_time, "-mat", "--ma_time",
+                  "MeshAdapt time frequency");   
    args.Parse();
    if (!args.Good())
    {
@@ -148,12 +179,126 @@ int main(int argc, char *argv[])
       return 1;
    }
    if (mpi.Root()) { args.PrintOptions(cout); }
+   
+   //3. Read the SCOREC Mesh
+   PCU_Comm_Init();
+#ifdef MFEM_USE_SIMMETRIX
+   Sim_readLicenseFile(0);
+   gmi_sim_start();
+   gmi_register_sim();
+#endif
+   gmi_register_mesh();
+
+   apf::Mesh2* pumi_mesh;
+   pumi_mesh = apf::loadMdsMesh(model_file, mesh_file); 
+   
+   int dim = pumi_mesh->getDimension();
+   int nEle = pumi_mesh->count(dim);
+   //rs_levels = (int)floor(log(50000./nEle)/log(2.)/dim);
+
+   if (geom_order > 1)
+   {
+      crv::BezierCurver bc(pumi_mesh, geom_order, 2);
+      bc.run();
+   }
+
+   // Perform Uniform refinement
+   if (rs_levels > 0)
+   {
+      ma::Input* uniInput = ma::configureUniformRefine(pumi_mesh, rs_levels);
+
+      if ( geom_order > 1)
+      {
+         crv::adapt(uniInput);
+      }
+      else
+      {
+         ma::adapt(uniInput);
+      }
+   }
+
+   pumi_mesh->verify();  
+   
+   //Read boundary
+   string bdr_tags;
+   named_ifgzstream input_bdr(boundary_file);
+   input_bdr >> ws;
+   getline(input_bdr, bdr_tags);
+   filter_dos(bdr_tags);
+   Array<int> XX, YY, ZZ;
+   int numOfent;
+   if (bdr_tags == "X")
+   {
+      input_bdr >> numOfent;
+      XX.SetSize(numOfent);
+      for (int kk = 0; kk < numOfent; kk++) {input_bdr >> XX[kk];}
+   } 
+   
+   skip_comment_lines(input_bdr, '#');
+   input_bdr >> bdr_tags;
+   filter_dos(bdr_tags);
+   if (bdr_tags == "Y")
+   {
+      input_bdr >> numOfent;
+      YY.SetSize(numOfent);
+      for (int kk = 0; kk < numOfent; kk++) {input_bdr >> YY[kk];}
+   }
+   
+   skip_comment_lines(input_bdr, '#');
+   input_bdr >> bdr_tags;
+   filter_dos(bdr_tags);
+   if (bdr_tags == "Z")
+   {
+       input_bdr >> numOfent;
+       ZZ.SetSize(numOfent);
+       for (int kk = 0; kk < numOfent; kk++) {input_bdr >> ZZ[kk];}
+   }
+   
+   // Create the MFEM mesh object from the PUMI mesh.
+   ParMesh *pmesh = new ParPumiMesh(MPI_COMM_WORLD, pumi_mesh);
+   
+   //Hack for the boundary condition
+   apf::MeshIterator* itr = pumi_mesh->begin(dim-1);
+   apf::MeshEntity* ent ;
+   int bdr_cnt = 0;
+   while ((ent = pumi_mesh->iterate(itr)))
+   {
+      apf::ModelEntity *me = pumi_mesh->toModel(ent);
+      if (pumi_mesh->getModelType(me) == (dim-1))
+      {
+         //Evrywhere 3 as initial
+         //(pmesh->GetBdrElement(bdr_cnt))->SetAttribute(3);
+         int tag = pumi_mesh->getModelTag(me);
+         if (XX.Find(tag) != -1)
+         {
+            //XX attr -> 1
+            (pmesh->GetBdrElement(bdr_cnt))->SetAttribute(1);
+         }
+         else if (YY.Find(tag) != -1)
+         {
+            //YY attr -> 2
+            (pmesh->GetBdrElement(bdr_cnt))->SetAttribute(2);
+         }
+         else if (ZZ.Find(tag) != -1)
+         {
+            //ZZ attr -> 3
+            (pmesh->GetBdrElement(bdr_cnt))->SetAttribute(3);    
+         }
+         else 
+         {
+             cout << " !!! ERROR !!! boundary has no attribute : " << endl;
+         }
+         bdr_cnt++;
+      }
+   }
+   pumi_mesh->end(itr);   
+   pmesh->SetAttributes();
 
    // Read the serial mesh from the given mesh file on all processors.
    // Refine the mesh in serial to increase the resolution.
-   Mesh *mesh = new Mesh(mesh_file, 1, 1);
-   const int dim = mesh->Dimension();
-   for (int lev = 0; lev < rs_levels; lev++) { mesh->UniformRefinement(); }
+   //Mesh *mesh = new Mesh(mesh_file, 1, 1);
+   //const int dim = mesh->Dimension();
+   //for (int lev = 0; lev < rs_levels; lev++) { mesh->UniformRefinement(); }
 
    if (p_assembly && dim == 1)
    {
@@ -163,84 +308,6 @@ int main(int argc, char *argv[])
          cout << "Laghos does not support PA in 1D. Switching to FA." << endl;
       }
    }
-
-   // Parallel partitioning of the mesh.
-   ParMesh *pmesh = NULL;
-   const int num_tasks = mpi.WorldSize(); int unit;
-   int *nxyz = new int[dim];
-   switch (partition_type)
-   {
-      case 11:
-      case 111:
-         unit = floor(pow(num_tasks, 1.0 / dim) + 1e-2);
-         for (int d = 0; d < dim; d++) { nxyz[d] = unit; }
-         if (dim == 2) { nxyz[2] = 0; }
-         break;
-      case 21: // 2D
-         unit = floor(pow(num_tasks / 2, 1.0 / 2) + 1e-2);
-         nxyz[0] = 2 * unit; nxyz[1] = unit; nxyz[2] = 0;
-         break;
-      case 211: // 3D.
-         unit = floor(pow(num_tasks / 2, 1.0 / 3) + 1e-2);
-         nxyz[0] = 2 * unit; nxyz[1] = unit; nxyz[2] = unit;
-         break;
-      case 221: // 3D.
-         unit = floor(pow(num_tasks / 4, 1.0 / 3) + 1e-2);
-         nxyz[0] = 2 * unit; nxyz[1] = 2 * unit; nxyz[2] = unit;
-         break;
-      case 311: // 3D.
-         unit = floor(pow(num_tasks / 3, 1.0 / 3) + 1e-2);
-         nxyz[0] = 3 * unit; nxyz[1] = unit; nxyz[2] = unit;
-         break;
-      case 321: // 3D.
-         unit = floor(pow(num_tasks / 6, 1.0 / 3) + 1e-2);
-         nxyz[0] = 3 * unit; nxyz[1] = 2 * unit; nxyz[2] = unit;
-         break;
-      case 322: // 3D.
-         unit = floor(pow(2 * num_tasks / 3, 1.0 / 3) + 1e-2);
-         nxyz[0] = 3 * unit / 2; nxyz[1] = unit; nxyz[2] = unit;
-         break;
-      case 432: // 3D.
-         unit = floor(pow(num_tasks / 3, 1.0 / 3) + 1e-2);
-         nxyz[0] = 2 * unit; nxyz[1] = 3 * unit / 2; nxyz[2] = unit;
-         break;
-      default:
-         if (myid == 0)
-         {
-            cout << "Unknown partition type: " << partition_type << '\n';
-         }
-         delete mesh;
-         MPI_Finalize();
-         return 3;
-   }
-   int product = 1;
-   for (int d = 0; d < dim; d++) { product *= nxyz[d]; }
-   if (product == num_tasks)
-   {
-      int *partitioning = mesh->CartesianPartitioning(nxyz);
-      pmesh = new ParMesh(MPI_COMM_WORLD, *mesh, partitioning);
-      delete partitioning;
-   }
-   else
-   {
-      if (myid == 0)
-      {
-         cout << "Non-Cartesian partitioning through METIS will be used.\n";
-#ifndef MFEM_USE_METIS
-         cout << "MFEM was built without METIS. "
-              << "Adjust the number of tasks to use a Cartesian split." << endl;
-#endif
-      }
-#ifndef MFEM_USE_METIS
-      return 1;
-#endif
-      pmesh = new ParMesh(MPI_COMM_WORLD, *mesh);
-   }
-   delete [] nxyz;
-   delete mesh;
-
-   // Refine the mesh further in parallel to increase the resolution.
-   for (int lev = 0; lev < rp_levels; lev++) { pmesh->UniformRefinement(); }
 
    int nzones = pmesh->GetNE(), nzones_min, nzones_max;
    MPI_Reduce(&nzones, &nzones_min, 1, MPI_INT, MPI_MIN, 0, pmesh->GetComm());
@@ -325,6 +392,8 @@ int main(int argc, char *argv[])
    x_gf.MakeRef(&H1FESpace, S, true_offset[0]);
    v_gf.MakeRef(&H1FESpace, S, true_offset[1]);
    e_gf.MakeRef(&L2FESpace, S, true_offset[2]);
+   ParGridFunction d_gf(&H1FESpace);
+   d_gf = 0.0;
 
    // Initialize x_gf using the starting mesh coordinates. This also links the
    // mesh positions to the values in x_gf.
@@ -363,12 +432,13 @@ int main(int argc, char *argv[])
    // Piecewise constant ideal gas coefficient over the Lagrangian mesh. The
    // gamma values are projected on a function that stays constant on the moving
    // mesh.
-   L2_FECollection mat_fec(0, pmesh->Dimension());
-   ParFiniteElementSpace mat_fes(pmesh, &mat_fec);
-   ParGridFunction mat_gf(&mat_fes);
-   FunctionCoefficient mat_coeff(hydrodynamics::gamma);
-   mat_gf.ProjectCoefficient(mat_coeff);
-   GridFunctionCoefficient *mat_gf_coeff = new GridFunctionCoefficient(&mat_gf);
+   //L2_FECollection mat_fec(0, pmesh->Dimension());
+   //ParFiniteElementSpace mat_fes(pmesh, &mat_fec);
+   //ParGridFunction mat_gf(&mat_fes);
+   //FunctionCoefficient mat_coeff(hydrodynamics::gamma);
+   //mat_gf.ProjectCoefficient(mat_coeff);
+   //GridFunctionCoefficient *mat_gf_coeff = new GridFunctionCoefficient(&mat_gf);
+   Coefficient *material_pcf = new FunctionCoefficient(hydrodynamics::gamma);
 
    // Additional details, depending on the problem.
    int source = 0; bool visc;
@@ -383,10 +453,10 @@ int main(int argc, char *argv[])
    }
 
    LagrangianHydroOperator oper(S.Size(), H1FESpace, L2FESpace,
-                                ess_tdofs, rho, source, cfl, mat_gf_coeff,
+                                ess_tdofs, rho, source, cfl, material_pcf,
                                 visc, p_assembly, cg_tol, cg_max_iter);
 
-   socketstream vis_rho, vis_v, vis_e;
+   socketstream vis_rho, vis_v, vis_e, vis_u;
    char vishost[] = "localhost";
    int  visport   = 19916;
 
@@ -402,6 +472,7 @@ int main(int argc, char *argv[])
       vis_rho.precision(8);
       vis_v.precision(8);
       vis_e.precision(8);
+      vis_u.precision(8);
 
       int Wx = 0, Wy = 0; // window position
       const int Ww = 350, Wh = 350; // window size
@@ -415,6 +486,10 @@ int main(int argc, char *argv[])
       Wx += offx;
       VisualizeField(vis_e, vishost, visport, e_gf,
                      "Specific Internal Energy", Wx, Wy, Ww, Wh);
+      
+      Wx += offx;
+      VisualizeField(vis_u, vishost, visport, d_gf,
+                     "Displacement", Wx, Wy, Ww, Wh);      
    }
 
    // Save data for VisIt visualization.
@@ -434,10 +509,21 @@ int main(int argc, char *argv[])
    // defines the Mult() method that used by the time integrators.
    ode_solver->Init(oper);
    oper.ResetTimeStepEstimate();
-   double t = 0.0, dt = oper.GetTimeStepEstimate(S), t_old;
+   double t = 0.0, dt = oper.GetTimeStepEstimate(S), t_old, ma_t = 0.0, vis_time = 0.0;
    bool last_step = false;
    int steps = 0;
    BlockVector S_old(S);
+   ParGridFunction dgf_old(d_gf);
+   
+   //MeshAdapt fields 
+   apf::Field* Vmag_field = 0;
+   apf::Field* Vel_field  = 0;
+   apf::Field* Dis_field  = 0;
+   apf::Field* U_field    = 0;   
+   apf::Field* Enr_field  = 0;
+   apf::Field* ipfield    = 0;
+   apf::Field* sizefield  = 0; 
+   
    for (int ti = 1; !last_step; ti++)
    {
       if (t + dt >= t_final)
@@ -447,15 +533,21 @@ int main(int argc, char *argv[])
       }
       if (steps == max_tsteps) { last_step = true; }
 
+      //Update displacement d = d + X_(n+1) - X_n
+      //First step : d = d - X_n
+      dgf_old = d_gf;
+      d_gf -= x_gf;
+      
       S_old = S;
       t_old = t;
       oper.ResetTimeStepEstimate();
 
       // S is the vector of dofs, t is the current time, and dt is the time step
       // to advance.
+      ode_solver->Init(oper);
       ode_solver->Step(S, t, dt);
       steps++;
-
+      
       // Adaptive time step control.
       const double dt_est = oper.GetTimeStepEstimate(S);
       if (dt_est < dt)
@@ -467,6 +559,7 @@ int main(int argc, char *argv[])
          { MFEM_ABORT("The time step crashed!"); }
          t = t_old;
          S = S_old;
+         d_gf = dgf_old;
          oper.ResetQuadratureData();
          if (mpi.Root()) { cout << "Repeating step " << ti << endl; }
          ti--; continue;
@@ -476,8 +569,14 @@ int main(int argc, char *argv[])
       // Make sure that the mesh corresponds to the new solution state.
       pmesh->NewNodes(x_gf, false);
 
-      if (last_step || (ti % vis_steps) == 0)
+      //Update displacement d = d + X_(n+1) - X_n
+      //Second step : d = d + X_(n+1)
+      d_gf += x_gf; 
+      
+      vis_time += dt;
+      if (last_step || vis_time > ma_time/10.0 || ma_t == 0.0)//(ti % vis_steps) == 0
       {
+         vis_time = 0.0;
          double loc_norm = e_gf * e_gf, tot_norm;
          MPI_Allreduce(&loc_norm, &tot_norm, 1, MPI_DOUBLE, MPI_SUM,
                        pmesh->GetComm());
@@ -511,6 +610,10 @@ int main(int argc, char *argv[])
             VisualizeField(vis_e, vishost, visport, e_gf,
                            "Specific Internal Energy", Wx, Wy, Ww,Wh);
             Wx += offx;
+            
+            VisualizeField(vis_u, vishost, visport, d_gf,
+                           "Displacement", Wx, Wy, Ww,Wh);
+            Wx += offx;            
          }
 
          if (visit)
@@ -553,6 +656,161 @@ int main(int argc, char *argv[])
             e_ofs.close();
          }
       }
+      
+      if (mpi.Root() && (ti % 100) == 0)
+       {
+            cout << fixed;
+            cout << "step " << setw(5) << ti
+                 << ",\tt = " << setw(5) << setprecision(4) << t
+                 << ",\tdt = " << setw(5) << setprecision(6) << dt << endl;
+         }      
+      //meshAdapt 
+      //Field* createStepField(Mesh* m, const char* name, int valueType)
+      //  Field transfer. V,X,e solution fields and Velocity magnitude field for
+      //  error estimation are created for the pumi mesh.
+      ma_t += dt;
+      if (ma_t > ma_time) //(steps % ma_step) == 0
+      {
+          ma_t = 0.0;
+    if (myid == 0) { cout << "Beginning MeshAdapt : " << endl;}      
+          if (order_v > geom_order)
+          {
+             Vmag_field = apf::createField(pumi_mesh, "field_mag",
+                                           apf::SCALAR, apf::getLagrange(order_v));
+             Vel_field = apf::createField(pumi_mesh, "V_field",
+                                           apf::VECTOR, apf::getLagrange(order_v));
+             Dis_field = apf::createField(pumi_mesh, "Crd_field",
+                                           apf::VECTOR, apf::getLagrange(order_v)); 
+             U_field = apf::createField(pumi_mesh, "U_field",
+                                           apf::VECTOR, apf::getLagrange(order_v));          
+          }
+          else
+          {
+             Vmag_field = apf::createFieldOn(pumi_mesh, "field_mag",apf::SCALAR);
+             Vel_field = apf::createFieldOn(pumi_mesh, "V_field", apf::VECTOR);
+             Dis_field = apf::createFieldOn(pumi_mesh, "Crd_field", apf::VECTOR); 
+             U_field = apf::createFieldOn(pumi_mesh, "U_field", apf::VECTOR);          
+          }
+          Enr_field = apf::createStepField(pumi_mesh, "E_field", apf::SCALAR);
+
+          ParPumiMesh* pPPmesh = dynamic_cast<ParPumiMesh*>(pmesh);
+          pPPmesh->VectorFieldMFEMtoPUMI(pumi_mesh, &x_gf, Dis_field, Vmag_field);
+          pPPmesh->VectorFieldMFEMtoPUMI(pumi_mesh, &d_gf, U_field, Vmag_field);      
+          pPPmesh->VectorFieldMFEMtoPUMI(pumi_mesh, &v_gf, Vel_field, Vmag_field);
+          pPPmesh->DGFieldMFEMtoPUMI(pumi_mesh, &e_gf, Enr_field);
+
+
+          ipfield= spr::getGradIPField(Vmag_field, "MFEM_gradip", 2);
+          sizefield = spr::getSPRSizeField(ipfield, adapt_ratio);
+
+          apf::destroyField(Vmag_field);
+          apf::destroyField(ipfield);
+          apf::destroyNumbering(pumi_mesh->findNumbering("LocalVertexNumbering"));
+
+          //write vtk file
+          apf::writeVtkFiles("before_ma", pumi_mesh);
+
+          // 19. Perform MesAdapt
+          ma::Input* erinput = ma::configure(pumi_mesh, sizefield);
+          erinput->shouldFixShape = true;
+          erinput->maximumIterations = 2;
+          //erinput->shouldCoarsen = false;
+          if ( geom_order > 1)
+          {
+             crv::adapt(erinput);
+          }
+          else
+          {
+             ma::adapt(erinput);
+          }
+
+          //write vtk file
+          apf::writeVtkFiles("After_ma", pumi_mesh);      
+
+          ParMesh* Adapmesh = new ParPumiMesh(MPI_COMM_WORLD, pumi_mesh);
+          pPPmesh->UpdateMesh(Adapmesh);
+          delete Adapmesh;
+          
+          //Hack for the boundary condition
+          apf::MeshIterator* itr = pumi_mesh->begin(dim-1);
+          apf::MeshEntity* ent ;
+          int bdr_cnt = 0;
+          while ((ent = pumi_mesh->iterate(itr)))
+          {
+              apf::ModelEntity *me = pumi_mesh->toModel(ent);
+              if (pumi_mesh->getModelType(me) == (dim-1))
+              {
+                  //Evrywhere 3 as initial
+                  //(pmesh->GetBdrElement(bdr_cnt))->SetAttribute(3);
+                  int tag = pumi_mesh->getModelTag(me);
+                  if (XX.Find(tag) != -1)
+                  {
+                      //XX attr -> 1
+                      (pmesh->GetBdrElement(bdr_cnt))->SetAttribute(1);
+                  }
+                  else if (YY.Find(tag) != -1)
+                  {
+                      //YY attr -> 2
+                      (pmesh->GetBdrElement(bdr_cnt))->SetAttribute(2);
+                  }
+                  else if (ZZ.Find(tag) != -1)
+                  {
+                      //ZZ attr -> 3
+                      (pmesh->GetBdrElement(bdr_cnt))->SetAttribute(3);    
+                  }
+                  else 
+                  {
+                       cout << " !!! ERROR !!! boundary has no attribute : " << endl;
+                  }
+                  bdr_cnt++;
+              }
+          }
+          pumi_mesh->end(itr);   
+          pmesh->SetAttributes();          
+          
+
+          // 20. Update the FiniteElementSpace, Gridfunction, and bilinear form
+          //fespace->Update();
+          H1FESpace.Update();
+          L2FESpace.Update();  
+          //Update Essential true dofs
+          oper.UpdateEssentialTrueDofs();
+          
+          //x.Update();
+          Vsize_l2 = L2FESpace.GetVSize();
+          Vsize_h1 = H1FESpace.GetVSize();
+          Array<int> updated_offset(4);
+          updated_offset[0] = 0;
+          updated_offset[1] = updated_offset[0] + Vsize_h1;
+          updated_offset[2] = updated_offset[1] + Vsize_h1;
+          updated_offset[3] = updated_offset[2] + Vsize_l2; 
+          S.Update(updated_offset);
+          x_gf.MakeRef(&H1FESpace, S, updated_offset[0]);
+          v_gf.MakeRef(&H1FESpace, S, updated_offset[1]);
+          int ll = L2FESpace.GetVSize();
+          int kk = S.Size(); 
+          e_gf.MakeRef(&L2FESpace, S, updated_offset[2]);      
+          x_gf = 0.0;
+          v_gf = 0.0;
+          e_gf = 0.0;
+          d_gf.Update();
+
+          pPPmesh->VectorFieldPUMItoMFEM(pumi_mesh, Dis_field, &x_gf);
+          pPPmesh->VectorFieldPUMItoMFEM(pumi_mesh, Vel_field, &v_gf);
+          pPPmesh->VectorFieldPUMItoMFEM(pumi_mesh, U_field, &d_gf);      
+          pPPmesh->DGFieldPUMItoMFEM(pumi_mesh, Enr_field, &e_gf);   
+          S_old.Update(updated_offset);
+          //a->Update();
+          //b->Update();
+          oper.MeshAdaptUpdate(S, d_gf);
+
+          //Destroy fields
+          apf::destroyField(Vel_field);
+          apf::destroyField(Dis_field);      
+          apf::destroyField(U_field);      
+          apf::destroyField(Enr_field);      
+          apf::destroyField(sizefield); 
+      }
    }
 
    switch (ode_solver_type)
@@ -573,7 +831,18 @@ int main(int argc, char *argv[])
    // Free the used memory.
    delete ode_solver;
    delete pmesh;
-   delete mat_gf_coeff;
+   delete material_pcf;
+   //delete mat_gf_coeff;
+   
+   pumi_mesh->destroyNative();
+   apf::destroyMesh(pumi_mesh);
+   PCU_Comm_Free();
+
+#ifdef MFEM_USE_SIMMETRIX
+   gmi_sim_stop();
+   Sim_unregisterAllKeys();
+#endif   
+   
 
    return 0;
 }
